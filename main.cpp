@@ -330,7 +330,6 @@ static int parse_response(bool *status, bool *audio, string *remaining_response,
             return 0;
         }
         string status_line = response.substr(0, pos);
-        cerr << status_line << endl;
         if (!check_status_line(status_line))
             return -1;
         *status = true;
@@ -375,7 +374,7 @@ static int parse_response(bool *status, bool *audio, string *remaining_response,
         while (*audio_left < response.size()) {
             cout << response.substr(0, *audio_left);
             response = response.substr(*audio_left);
-            assert(response.size() > 0);
+            assert(!response.empty());
             int metadata_block_len = ((int) response[0]) * 16;
             if (response.size() < metadata_block_len + 1) {
                 // Metadata block is broken in the middle.
