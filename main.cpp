@@ -111,7 +111,7 @@ static int parse_string_to_number(const string &s) {
  * Return -1 if at least one argument is wrong.
  * @param argc [in]   - number of arguments,
  * @param argv [in]   = array of arguments.
- * @return
+ * @return Value @p 0 if arguments are correct or -1 if they are wrong.
  */
 static int parse_args(int argc, char *argv[]) {
     if (argc < 7 || argc % 2 == 0)
