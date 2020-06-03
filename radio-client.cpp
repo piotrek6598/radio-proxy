@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 
 extern "C" {
 #include "err.h"
@@ -159,6 +160,14 @@ static int connect_to_radio_proxy() {
     sock = socket(PF_INET, SOCK_DGRAM, 0);
     if (sock < 0)
         syserr("socket");
+    int optval = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (void*)&optval, sizeof optval) < 0)
+        syserr("broadcast");
+    optval = 4;
+    if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, (void*)&optval, sizeof optval) < 0)
+        syserr("multicast ttl");
+    if (inet_aton(host_addr.c_str(), &srvr_addr.sin_addr) == 0)
+        syserr("inet aton");
     int i = 0;
     sflags = 0;
     rcva_len = (socklen_t) sizeof(my_addr);

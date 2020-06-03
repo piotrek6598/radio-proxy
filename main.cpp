@@ -3,6 +3,7 @@
 #include <cstring>
 #include <climits>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <csignal>
@@ -32,6 +33,9 @@ using namespace std::chrono;
  */
 #define NO_METADATA -1
 
+/**
+ * Macros defining types of clients' messages in proxy mode.
+ */
 #define DISCOVER 1
 #define IAM 2
 #define KEEPALIVE 3
@@ -44,7 +48,7 @@ using namespace std::chrono;
  */
 unordered_map<string, int> req_args;
 unordered_map<string, int> opt_args;
-unordered_map<string, int> intermediary_opt_args;
+unordered_map<string, int> proxy_opt_args;
 
 // Arguments defining details of connection to radio server.
 string host_name;
@@ -53,12 +57,19 @@ int port_num;
 bool metadata_request = false;
 int server_timeout = 5;
 
-// Arguments defining details of connection to clients in intermediary mode.
-int intermediary_port_num = -1;
+// Arguments defining details of connection to clients in proxy mode.
+int proxy_port_num = -1;
 string multicast_address;
 int client_timeout = 5;
 
+// Name of transmitted radio.
 static string radio_name;
+
+ip_mreq multicast_group;
+
+int clients_scoket_last_timeout = 0;
+
+sockaddr_in radio_proxy_addr;
 
 // Variable defining when program should finish work.
 static bool finish_work = false;
@@ -66,10 +77,15 @@ static bool finish_work = false;
 // Size of audio block between two metadata blocks.
 int metadata_interval = NO_METADATA;
 
+/**
+ * Map of active clients is updated every time data are sent or new client appears.
+ * Used only in proxy mode. Keys are pairs of client address and port number.
+ * Values are pairs of client's sockaddr_in struct and last activity timestamp.
+ */
 map<pair<uint32_t, uint16_t>, pair<sockaddr_in, time_point<high_resolution_clock>>> clients;
 
 
-/** @brieff Signal handler.
+/** @brief Signal handler.
  * Marks that program should finish work.
  * @param signal [in]   - signal number (unused).
  */
@@ -88,8 +104,8 @@ static void setup() {
     req_args.insert({"-p", 0});
     opt_args.insert({"-m", 0});
     opt_args.insert({"-t", 0});
-    intermediary_opt_args.insert({"-B", 0});
-    intermediary_opt_args.insert({"-T", 0});
+    proxy_opt_args.insert({"-B", 0});
+    proxy_opt_args.insert({"-T", 0});
 
     sigemptyset(&block_mask);
     action.sa_handler = catch_int;
@@ -135,16 +151,16 @@ static int parse_args(int argc, char *argv[]) {
         if (search == req_args.end()) {
             search = opt_args.find(argv[i]);
             if (search == opt_args.end()) {
-                search = intermediary_opt_args.find(argv[i]);
-                if (search == intermediary_opt_args.end()) {
-                    // This should be intermediary required argument.
+                search = proxy_opt_args.find(argv[i]);
+                if (search == proxy_opt_args.end()) {
+                    // This should be proxy required argument.
                     if (strcmp("-P", argv[i]) == 0) {
-                        if (intermediary_port_num != -1)
+                        if (proxy_port_num != -1)
                             return -1;
                         int p = parse_string_to_number(argv[i + 1]);
                         if (p == -1 || p > MAX_PORT_NUM)
                             return -1;
-                        intermediary_port_num = p;
+                        proxy_port_num = p;
                     } else {
                         // Invalid argument.
                         return -1;
@@ -211,12 +227,15 @@ static int parse_args(int argc, char *argv[]) {
             return -1;
     }
 
-    for (auto &intermediary_opt_arg : intermediary_opt_args) {
-        if (intermediary_opt_arg.second > 1 || intermediary_opt_arg.second < 0)
+    // Checks if all proxy optional arguments appeared at most ones.
+    for (auto &proxy_opt_arg : proxy_opt_args) {
+        if (proxy_opt_arg.second > 1 || proxy_opt_arg.second < 0)
+            return -1;
+        if (proxy_port_num == -1 && proxy_opt_arg.second != 0)
             return -1;
     }
 
-    // Converting timeouts to miliseconds.
+    // Converting timeouts to milliseconds.
     client_timeout *= 1000;
     server_timeout *= 1000;
 
@@ -261,17 +280,41 @@ static int connect_to_server(string &server, int port) {
     return sock;
 }
 
+static int add_multicast_membership(int sock) {
+    multicast_group.imr_interface.s_addr = htonl(INADDR_ANY);
+    if (inet_aton(multicast_address.c_str(), &multicast_group.imr_multiaddr) ==
+        0)
+        return -1;
+
+    if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                   (void *) &multicast_group, sizeof multicast_group) < 0)
+        return -1;
+    return 0;
+}
+
+/** @brief Creates socket which clients can connect.
+ * Creates a socket enabling communication with clients via UDP.
+ * If connection is impossible terminates program with exitcode 1.
+ * @param server [in]   - server name,
+ * @param port [in]     - port number.
+ * @return Socket descriptor.
+ */
 static int create_proxy_socket() {
-    sockaddr_in radio_proxy_addr{};
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
 
     if (sock < 0)
         syserr("sock");
 
+    if (!multicast_address.empty()) {
+        if (add_multicast_membership(sock) != 0)
+            syserr("wrong multicast address");
+    }
+
+
     radio_proxy_addr.sin_family = AF_INET;
     radio_proxy_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    radio_proxy_addr.sin_port = htons(intermediary_port_num);
+    radio_proxy_addr.sin_port = htons(proxy_port_num);
 
     if (bind(sock, (sockaddr *) &radio_proxy_addr,
              (socklen_t) sizeof(radio_proxy_addr)) < 0) {
@@ -337,24 +380,45 @@ static int extract_metadata_interval(string &line) {
     return (int) result;
 }
 
-void set_socket_writing_timeout(int timeout_ms, int sock) {
+/** @brief Set timeout on writing to socket.
+ * Set timeout min(timeout_ms, 500). Do nothing if new timeout is equal
+ * to current timeout. Terminates with exitcode 1 if error occurred.
+ * @param timeout_ms [in]   - new timeout in milliseconds,
+ * @param sock [in]         - socket descriptor.
+ */
+static void set_socket_writing_timeout(int timeout_ms, int sock) {
     timeval timeout{};
+
+    if (timeout_ms == clients_scoket_last_timeout)
+        return;
+
+    if (timeout_ms > 500)
+        timeout_ms = 500;
+
     timeout.tv_sec = timeout_ms / 1000;
     timeout.tv_usec = (timeout_ms % 1000) * 1000;
     if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (void *) &timeout,
                    sizeof(timeout)) < 0)
         syserr("sockopt failed");
+    clients_scoket_last_timeout = timeout_ms;
 }
 
-int send_data_to_active_clients(const string &data, int timeout_ms, int sock,
-                                bool check_if_active) {
+/** @brief Sends data received from radio server to active clients.
+ * If requested, checks every client if he is still active. Client is treated
+ * as active if he sent @ref DISCOVER or @ref KEEPALIVE message in last
+ * @ref client_timeout milliseconds.
+ * @param data            [in]   - data to send,
+ * @param timeout_ms      [in]   - timeout per single send,
+ * @param sock            [in]   - socket descriptor, where data are written,
+ * @param check_if_active [in]   - flag indicates if client's activity is checked
+ *                                 before sending data.
+ * @return Duration of function runtime in milliseconds.
+ */
+static int send_data_to_active_clients(const string &data, int timeout_ms,
+                                       int sock, bool check_if_active) {
     auto start = high_resolution_clock::now();
     auto it = clients.begin();
 
-    if (timeout_ms < 500)
-        set_socket_writing_timeout(timeout_ms, sock);
-    else
-        set_socket_writing_timeout(500, sock);
 
     while (it != clients.end()) {
         if (check_if_active &&
@@ -363,9 +427,23 @@ int send_data_to_active_clients(const string &data, int timeout_ms, int sock,
             auto new_it = clients.erase(it);
             it = new_it;
         } else {
-            auto snda_len = (socklen_t) sizeof(it->second.first);
-            sendto(sock, data.c_str(), data.size(), 0,
-                   (sockaddr *) &(it->second.first), snda_len);
+            size_t msg_len = data.size();
+            size_t msg_sent = 0;
+            int timeout_left = timeout_ms;
+            do {
+                set_socket_writing_timeout(timeout_left, sock);
+                auto snda_len = (socklen_t) sizeof(it->second.first);
+
+                auto send_start = high_resolution_clock::now();
+                size_t len = sendto(sock, data.c_str(), data.size(), 0,
+                                    (sockaddr *) &(it->second.first), snda_len);
+                auto send_end = high_resolution_clock::now();
+
+                if (len >= 0)
+                    msg_sent += len;
+                timeout_left -= duration_cast<milliseconds>(
+                        send_end - send_start).count();
+            } while (msg_sent != msg_len && timeout_left > 0);
             // Ignoring partial write or exceeding timeout.
             it++;
         }
@@ -374,7 +452,14 @@ int send_data_to_active_clients(const string &data, int timeout_ms, int sock,
     return duration_cast<milliseconds>(end - start).count();
 }
 
-string create_msg_to_client(uint16_t type, const string &data) {
+/** @brief Creates message to client.
+ * Message contains header of first 16 bits indicating message's type and
+ * next 16 bits indicating message's length.
+ * @param type [in]   - message type,
+ * @param data [in]   - message content.
+ * @return Message with included header.
+ */
+static string create_msg_to_client(uint16_t type, const string &data) {
     char msg_header[4];
     uint16_t msg_type = htons(type);
     uint16_t msg_len = htons(data.size());
@@ -385,8 +470,17 @@ string create_msg_to_client(uint16_t type, const string &data) {
     return msg;
 }
 
-int sending_or_printing_data(const string &audio_stream,
-                             const string &meta_stream, int sock) {
+/** @brief Sends data to clients.
+ * Data are written to @p sock socket. If @p sock is -1, prints audio data
+ * to stdout and meta data to stderr.
+ * @param audio_stream [in]   - audio data,
+ * @param meta_stream  [in]   - meta data,
+ * @param sock         [in]   - socket descriptor, where data are written.
+ * @return Duration of sending data in milliseconds if @p sock is not -1,
+ * otherwise returns 0.
+ */
+static int sending_or_printing_data(const string &audio_stream,
+                                    const string &meta_stream, int sock) {
     int audio_send_time = 0, meta_send_time = 0;
     int timeout_ms = server_timeout / 3;
     string msg;
@@ -395,9 +489,11 @@ int sending_or_printing_data(const string &audio_stream,
         timeout_ms /= clients.size();
 
     if (sock != -1) {
-        msg = create_msg_to_client(AUDIO, audio_stream);
-        audio_send_time = send_data_to_active_clients(
-                msg, timeout_ms, sock, true);
+        if (!audio_stream.empty()) {
+            msg = create_msg_to_client(AUDIO, audio_stream);
+            audio_send_time = send_data_to_active_clients(
+                    msg, timeout_ms, sock, true);
+        }
         if (!meta_stream.empty()) {
             msg = create_msg_to_client(METADATA, meta_stream);
             meta_send_time = send_data_to_active_clients(
@@ -405,7 +501,8 @@ int sending_or_printing_data(const string &audio_stream,
         }
         return audio_send_time + meta_send_time;
     } else {
-        cout << audio_stream;
+        if (!audio_stream.empty())
+            cout << audio_stream;
         if (!meta_stream.empty())
             cerr << meta_stream;
         return 0;
@@ -425,7 +522,8 @@ int sending_or_printing_data(const string &audio_stream,
  *                                        converted to string.
  * @param audio_left [in,out]           - pointer to number of audio data which
  *                                        come before next metadata block.
- * @return Value @p 0 in case of success, value @p -1 if any error occurred.
+ * @return If error occurred value @p -1. Otherwise duration of sending data
+ * in milliseconds if @p sock is not -1 or 0 if @p sock is -1.
  */
 static int parse_response(bool *status, bool *audio, string *remaining_response,
                           const string &buffer_string, int *audio_left,
@@ -478,13 +576,18 @@ static int parse_response(bool *status, bool *audio, string *remaining_response,
                     return -1;
                 }
             }
+
             if (header_line.find("icy-name") == 0) {
-                pos2 = header_line.find(":");
+                pos2 = header_line.find(':');
                 if (pos2 == string::npos)
-                    return -1;
+                    return -1; // Shouldn't occur, line doesn't match pattern.
                 pos2++;
+
+                // skipping spaces between ':' and radio name
                 while (pos2 < header_line.size() && header_line[pos2] == ' ')
                     pos2++;
+
+                // saving radio name
                 radio_name = header_line.substr(pos2, pos - pos2);
             }
         } else {
@@ -570,8 +673,9 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
         if (waiting_time < 0)
             waiting_time = 0;
 
+        auto start_poll_timeout = high_resolution_clock::now();
         ret = poll(client, 2, waiting_time);
-        auto timestamp = high_resolution_clock::now();
+        auto end_poll_timeout = high_resolution_clock::now();
         if (ret == -1) {
             if (errno != EINTR)
                 syserr("poll");
@@ -593,8 +697,9 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
                     else
                         exitcode = 0;
                 } else {
-                    // todo read failed
-                    cerr << "read failed" << endl;
+                    // read failed, reducing possible timeout.
+                    timeout_used += duration_cast<milliseconds>(
+                            end_poll_timeout - start_poll_timeout).count();
                 }
             }
             if (client[1].fd != -1 &&
@@ -607,59 +712,54 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
                 pair<uint32_t, uint16_t> cl_addr;
                 cl_addr.first = ntohl(client_addr.sin_addr.s_addr);
                 cl_addr.second = ntohs(client_addr.sin_port);
-                if (rval == 0) {
+                /*if (rval == 0) {
                     // client close_connection
                     auto search = clients.find(cl_addr);
                     if (search != clients.end())
                         clients.erase(search);
-                } else if (rval > 0) {
-                    if (rval >= 4) {
-                        uint16_t msg_type_bytes;
-                        uint16_t msg_len_bytes;
-                        memmove(&msg_type_bytes, CLIENTS_BUFFER, 2);
-                        memmove(&msg_len_bytes, CLIENTS_BUFFER + 2, 2);
-                        //cerr << msg_type_bytes << " " << msg_len_bytes << endl;
-                        uint16_t msg_type = ntohs(msg_type_bytes);
-                        uint16_t msg_len = ntohs(msg_len_bytes);
-                        // todo to jest debug
-                        //cerr << msg_type << " " << msg_len << endl;
+                } else*/
+                if (rval >= 4) {
+                    uint16_t msg_type_bytes;
+                    uint16_t msg_len_bytes;
+                    memmove(&msg_type_bytes, CLIENTS_BUFFER, 2);
+                    memmove(&msg_len_bytes, CLIENTS_BUFFER + 2, 2);
+                    //cerr << msg_type_bytes << " " << msg_len_bytes << endl;
+                    uint16_t msg_type = ntohs(msg_type_bytes);
+                    uint16_t msg_len = ntohs(msg_len_bytes);
 
-                        if (msg_type == DISCOVER || msg_type == KEEPALIVE) {
-                            // Updating timestamp.
-                            auto search = clients.find(cl_addr);
-                            if (search == clients.end()) {
-                                clients.insert(
-                                        {cl_addr, {client_addr, timestamp}});
+                    if (msg_type == DISCOVER || msg_type == KEEPALIVE) {
+                        // Updating end_poll_timeout.
+                        auto search = clients.find(cl_addr);
+                        if (search == clients.end()) {
+                            clients.insert(
+                                    {cl_addr, {client_addr, end_poll_timeout}});
+                        } else {
+                            search->second.second = end_poll_timeout;
+                        }
+                        if (msg_type == DISCOVER) {
+                            string iam_response = create_msg_to_client(IAM,
+                                                                       radio_name);
+                            if (server_timeout - timeout_used >= 500) {
+                                set_socket_writing_timeout(500,
+                                                           radio_proxy_sock);
                             } else {
-                                search->second.second = timestamp;
+                                set_socket_writing_timeout(
+                                        server_timeout - timeout_used,
+                                        radio_proxy_sock);
                             }
-                            if (msg_type == DISCOVER) {
-                                string iam_response = create_msg_to_client(IAM,
-                                                                           radio_name);
-                                if (server_timeout - timeout_used >= 500) {
-                                    set_socket_writing_timeout(500,
-                                                               radio_proxy_sock);
-                                } else {
-                                    set_socket_writing_timeout(
-                                            server_timeout - timeout_used,
-                                            radio_proxy_sock);
-                                }
-                                auto start = high_resolution_clock::now();
-                                auto snda_len = (socklen_t) sizeof(client_addr);
-                                sendto(radio_proxy_sock, iam_response.c_str(),
-                                       iam_response.size(), 0,
-                                       (sockaddr *) &(client_addr), snda_len);
-                                auto end = high_resolution_clock::now();
-                                timeout_used += duration_cast<milliseconds>(
-                                        end - start).count();
-                            }
+                            auto start = high_resolution_clock::now();
+                            auto snda_len = (socklen_t) sizeof(client_addr);
+                            sendto(radio_proxy_sock, iam_response.c_str(),
+                                   iam_response.size(), 0,
+                                   (sockaddr *) &(client_addr), snda_len);
+                            auto end = high_resolution_clock::now();
+                            timeout_used += duration_cast<milliseconds>(
+                                    end - start).count();
                         }
                     }
-                    // Ignoring too short message.
-                } else {
-                    // todo recvfrom failed.
-                    cerr << "recvfrom failed" << endl;
+                    // Ignoring message of wrong type.
                 }
+                // Ignoring too short message or reading failure.
             }
         } else {
             cerr << "Radio server timeout exceeded" << endl;
@@ -681,15 +781,22 @@ int main(int argc, char *argv[]) {
     }
     int sock = connect_to_server(host_name, port_num);
 
-    if (intermediary_port_num == -1)
+    if (proxy_port_num == -1)
         udp_sock = -1;
     else
         udp_sock = create_proxy_socket();
-    cerr << udp_sock << endl;
+
     int exitcode = receiving_response(sock, udp_sock);
     if (close(sock) < 0)
         syserr("close");
     if (udp_sock != -1) {
+        if (!multicast_address.empty()) {
+            if (setsockopt(udp_sock, IPPROTO_IP, IP_DROP_MEMBERSHIP,
+                           (void *) &multicast_group, sizeof multicast_group) <
+                0) {
+                syserr("setsockopt");
+            }
+        }
         if (close(udp_sock) < 0)
             syserr("close");
     }
