@@ -3,4 +3,5 @@ project(radio_proxy)
 
 set(CMAKE_CXX_STANDARD 14)
 
-add_executable(radio_proxy main.cpp err.h err.c)
+add_executable(radio-proxy main.cpp err.h err.c)
+add_executable(radio-client radio-client.cpp err.h err.c)
