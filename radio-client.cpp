@@ -87,7 +87,7 @@ static int parse_args(int argc, char *argv[]) {
                 int p = parse_string_to_number(argv[i + 1]);
                 if (p == -1 || p > MAX_PORT_NUM)
                     return -1;
-                telnet_port = -1;
+                telnet_port = p;
             } else {
                 return -1; // Program shouldn't reach this code.
             }
@@ -100,7 +100,9 @@ static int parse_args(int argc, char *argv[]) {
     }
 
     if (timeout == -1)
-        timeout = 5;
+        timeout = 5000;
+    else
+        timeout *= 1000;
 
     return 0;
 }
@@ -195,7 +197,9 @@ static int connect_to_radio_proxy() {
             cerr << rsp << endl;
         i++;
         if (i == 10) {
+            cerr << "KEEPALIVE" << endl;
             s = create_msg_to_client(3, "");
+            cerr << "Succesfull" << endl;
             sflags = 0;
             rcva_len = (socklen_t) sizeof(my_addr);
             snd_len = sendto(sock, s.c_str(), s.size(), sflags,

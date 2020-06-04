@@ -54,20 +54,20 @@ unordered_map<string, int> proxy_opt_args;
 string host_name;
 string resource_name;
 int port_num;
-bool metadata_request = false;
-int server_timeout = 5;
+bool metadata_request;
+int server_timeout;
 
 // Arguments defining details of connection to clients in proxy mode.
-int proxy_port_num = -1;
+int proxy_port_num;
 string multicast_address;
-int client_timeout = 5;
+int client_timeout;
 
 // Name of transmitted radio.
 static string radio_name;
 
 ip_mreq multicast_group;
 
-int clients_scoket_last_timeout = 0;
+int clients_socket_last_timeout;
 
 sockaddr_in radio_proxy_addr;
 
@@ -106,6 +106,12 @@ static void setup() {
     opt_args.insert({"-t", 0});
     proxy_opt_args.insert({"-B", 0});
     proxy_opt_args.insert({"-T", 0});
+
+    clients_socket_last_timeout = 0;
+    metadata_request = false;
+    server_timeout = 5;
+    proxy_port_num = -1;
+    client_timeout = 5;
 
     sigemptyset(&block_mask);
     action.sa_handler = catch_int;
@@ -389,18 +395,18 @@ static int extract_metadata_interval(string &line) {
 static void set_socket_writing_timeout(int timeout_ms, int sock) {
     timeval timeout{};
 
-    if (timeout_ms == clients_scoket_last_timeout)
+    if (timeout_ms == clients_socket_last_timeout)
         return;
 
     if (timeout_ms > 500)
         timeout_ms = 500;
 
-    timeout.tv_sec = timeout_ms / 1000;
-    timeout.tv_usec = (timeout_ms % 1000) * 1000;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = timeout_ms * 1000;
     if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (void *) &timeout,
                    sizeof(timeout)) < 0)
         syserr("sockopt failed");
-    clients_scoket_last_timeout = timeout_ms;
+    clients_socket_last_timeout = timeout_ms;
 }
 
 /** @brief Sends data received from radio server to active clients.
@@ -435,7 +441,7 @@ static int send_data_to_active_clients(const string &data, int timeout_ms,
                 auto snda_len = (socklen_t) sizeof(it->second.first);
 
                 auto send_start = high_resolution_clock::now();
-                size_t len = sendto(sock, data.c_str(), data.size(), 0,
+                size_t len = sendto(sock, data.c_str() + msg_sent, data.size() - msg_sent, 0,
                                     (sockaddr *) &(it->second.first), snda_len);
                 auto send_end = high_resolution_clock::now();
 
@@ -443,7 +449,7 @@ static int send_data_to_active_clients(const string &data, int timeout_ms,
                     msg_sent += len;
                 timeout_left -= duration_cast<milliseconds>(
                         send_end - send_start).count();
-            } while (msg_sent != msg_len && timeout_left > 0);
+            } while (msg_sent < msg_len && timeout_left > 0);
             // Ignoring partial write or exceeding timeout.
             it++;
         }
@@ -728,7 +734,7 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
                     uint16_t msg_len = ntohs(msg_len_bytes);
 
                     if (msg_type == DISCOVER || msg_type == KEEPALIVE) {
-                        // Updating end_poll_timeout.
+                        // Updating client activity timestamp.
                         auto search = clients.find(cl_addr);
                         if (search == clients.end()) {
                             clients.insert(
@@ -747,8 +753,8 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
                                         server_timeout - timeout_used,
                                         radio_proxy_sock);
                             }
-                            auto start = high_resolution_clock::now();
                             auto snda_len = (socklen_t) sizeof(client_addr);
+                            auto start = high_resolution_clock::now();
                             sendto(radio_proxy_sock, iam_response.c_str(),
                                    iam_response.size(), 0,
                                    (sockaddr *) &(client_addr), snda_len);
