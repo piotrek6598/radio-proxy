@@ -32,6 +32,13 @@ extern "C" {
 #define move_down "\033[1B"
 #define move_up "\033[1A"
 
+
+#define PROXY_TIMEOUT 1
+#define KEEPALIVE_TIMEOUT 2
+#define ALL_TIMEOUTS 3
+
+#define KEEPALIVE_TIMEOUT_VAL 3500
+
 #define DISCOVER 1
 #define IAM 2
 #define KEEPALIVE 3
@@ -39,6 +46,7 @@ extern "C" {
 #define METADATA 6
 
 using namespace std;
+using namespace std::chrono;
 
 unordered_map<string, int> req_args;
 vector<string> radio_proxy_names;
@@ -48,6 +56,9 @@ string host_addr;
 int radio_proxy_port;
 int telnet_port;
 int timeout = -1;
+int keepalive_timeout_left = 3500;
+int proxy_timeout_left;
+bool proxy_timeout_selected;
 int proxy_choice = -1;
 
 size_t menu_lines_count = 0;
@@ -125,7 +136,6 @@ static int parse_args(int argc, char *argv[]) {
                     return -1;
                 radio_proxy_port = p;
             } else if (strcmp("-H", argv[i]) == 0) {
-                // todo check if it's correct.
                 host_addr = argv[i + 1];
             } else if (strcmp("-p", argv[i]) == 0) {
                 int p = parse_string_to_number(argv[i + 1]);
@@ -249,6 +259,38 @@ string parse_stream_msg(uint16_t len, string &response, int sock) {
     }
 
     return stream_msg;
+}
+
+int get_next_timeout() {
+    if (proxy_choice == -1)
+        return -1;
+    proxy_timeout_selected = proxy_timeout_left < keepalive_timeout_left;
+    return min(proxy_timeout_left, keepalive_timeout_left);
+}
+
+void decrease_timeouts(int timeouts_type, int timeout_ms) {
+    if (timeouts_type == ALL_TIMEOUTS) {
+        proxy_timeout_left -= timeout_ms;
+        keepalive_timeout_left -= timeout_ms;
+    } else if (timeouts_type == KEEPALIVE_TIMEOUT) {
+        keepalive_timeout_left -= timeout_ms;
+    } else if (timeouts_type == PROXY_TIMEOUT) {
+        proxy_timeout_left -= timeout_ms;
+    }
+
+    proxy_timeout_left = proxy_timeout_left > 0 ? proxy_timeout_left : 0;
+    keepalive_timeout_left =
+            keepalive_timeout_left > 0 ? keepalive_timeout_left : 0;
+}
+
+void
+write_typemsg_to_proxy_socket(int socket, int msg_type, sockaddr_in &addr) {
+    string s = create_msg_to_client(msg_type, "");
+    auto rcva_len = (socklen_t) sizeof(addr);
+    ssize_t snd_len = sendto(socket, s.c_str(), s.size(), 0, (sockaddr *) &addr,
+                             rcva_len);
+    if (snd_len != s.size())
+        syserr("partial / failed write");
 }
 
 int write_msg_to_telnet(int telnet_sock, const string &msg) {
@@ -383,11 +425,16 @@ int handle_telnet_session() {
     sockaddr_in srvr_addr{};
     sockaddr_in telnet_server{};
 
-    int ret, msg_sock, err;
+    int ret, msg_sock, err, exitcode = 0;
     int sock;
     ssize_t rval;
     ssize_t snd_len;
     socklen_t rcva_len;
+
+    bool update_timeouts = true;
+
+    if (inet_aton(host_addr.c_str(), &srvr_addr.sin_addr) == 0)
+        syserr("inet aton");
 
     memset(&addr_hints, 0, sizeof(addrinfo));
     addr_hints.ai_family = AF_INET;
@@ -425,8 +472,6 @@ int handle_telnet_session() {
                    sizeof optval) < 0)
         syserr("multicast ttl");
 
-    if (inet_aton(host_addr.c_str(), &srvr_addr.sin_addr) == 0)
-        syserr("inet aton");
 
     for (auto &i : clients) {
         i.fd = -1;
@@ -453,8 +498,12 @@ int handle_telnet_session() {
     do {
         for (auto &i : clients)
             i.revents = 0;
+        update_timeouts = proxy_choice != -1;
 
-        ret = poll(clients, 3, -1);
+        auto start = high_resolution_clock::now();
+        ret = poll(clients, 3, get_next_timeout());
+        auto end = high_resolution_clock::now();
+
         if (ret == -1) {
             if (errno != EINTR)
                 syserr("poll");
@@ -505,27 +554,22 @@ int handle_telnet_session() {
                             } else if (telnet_curr_line == 1) {
                                 radio_proxy_names.clear();
                                 radio_proxy_addrs.clear();
-                                string s = create_msg_to_client(DISCOVER, "");
-                                rcva_len = (socklen_t) sizeof(my_addr);
-                                snd_len = sendto(sock, s.c_str(), s.size(), 0,
-                                                 (sockaddr *) &my_addr,
-                                                 rcva_len);
-                                if (snd_len != s.size())
-                                    syserr("partial / failed write");
+                                write_typemsg_to_proxy_socket(clients[2].fd,
+                                                              DISCOVER,
+                                                              my_addr);
                                 //cerr << "DISCOVER sent" << endl;
                             } else {
                                 proxy_choice = (int) telnet_curr_line - 2;
                                 sockaddr_in proxy_addr = radio_proxy_addrs[proxy_choice];
-                                send_menu_to_telnet(clients[1].fd);
+                                safe_menu_telnet_write(&clients[1].fd);
                                 // sending first discover
-                                string s = create_msg_to_client(DISCOVER, "");
-                                rcva_len = (socklen_t) sizeof(proxy_addr);
-                                snd_len = sendto(sock, s.c_str(), s.size(), 0,
-                                                 (sockaddr *) &proxy_addr,
-                                                 rcva_len);
-                                if (snd_len != s.size())
-                                    syserr("partial / failed write");
-                                // todo timeout and keepalive sending
+                                write_typemsg_to_proxy_socket(clients[2].fd,
+                                                              DISCOVER,
+                                                              proxy_addr);
+                                // schduling timeouts
+                                proxy_timeout_left = timeout;
+                                keepalive_timeout_left = KEEPALIVE_TIMEOUT_VAL;
+                                update_timeouts = false;
                             }
                         }
                     } else if (rval == 3) {
@@ -573,6 +617,12 @@ int handle_telnet_session() {
                     if (type == AUDIO && proxy_num >= 0 &&
                         proxy_num == proxy_choice) {
                         cout << parse_stream_msg(len, response, clients[2].fd);
+                        // timeouts updating
+                        proxy_timeout_left = timeout;
+                        decrease_timeouts(KEEPALIVE_TIMEOUT,
+                                          duration_cast<milliseconds>(
+                                                  end - start).count());
+                        update_timeouts = false;
                     }
 
                     if (type == METADATA && proxy_num >= 0 &&
@@ -580,13 +630,49 @@ int handle_telnet_session() {
                         string metadata = parse_stream_msg(len, response,
                                                            clients[2].fd);
                         safe_metadata_telnet_write(&clients[1].fd, metadata);
+                        // timeouts update
+                        if (update_timeouts) {
+                            proxy_timeout_left = timeout;
+                            decrease_timeouts(KEEPALIVE_TIMEOUT,
+                                              duration_cast<milliseconds>(
+                                                      end - start).count());
+                            update_timeouts = false;
+                        }
                     }
                     // Ignoring message of wrong type.
                 }
             }
+            // updating timeouts if not done previously
+            if (update_timeouts)
+                decrease_timeouts(ALL_TIMEOUTS, duration_cast<milliseconds>(
+                        end - start).count());
         } else {
-            // timeout exceeded, program shouldn't reach this code.
-            return 1;
+            if (update_timeouts) {
+                if (proxy_timeout_selected) {
+                    // disabling proxy
+                    radio_proxy_names.erase(radio_proxy_names.cbegin() + proxy_choice);
+                    radio_proxy_addrs.erase(radio_proxy_addrs.cbegin() + proxy_choice);
+                    proxy_choice = -1;
+                    // proxy_choice = -1 implies that timeouts are disabled.
+                    // printing new menu
+                    safe_menu_telnet_write(&clients[1].fd);
+                } else {
+                    // sending KEEPALIVE
+                    sockaddr_in proxy_addr = radio_proxy_addrs[proxy_choice];
+                    write_typemsg_to_proxy_socket(clients[2].fd, KEEPALIVE,
+                                                  proxy_addr);
+                    // updating timeouts
+                    decrease_timeouts(PROXY_TIMEOUT,
+                                      duration_cast<milliseconds>(
+                                              end - start).count());
+                    keepalive_timeout_left = KEEPALIVE_TIMEOUT_VAL;
+                }
+            } else {
+                // Program shouldn't reach this code.
+                cerr << "Unexpected poll timeout" << endl;
+                finish_work = true;
+                exitcode = 1;
+            }
         }
     } while (!finish_work);
 
@@ -596,7 +682,7 @@ int handle_telnet_session() {
         if (clients[i].fd >= 0)
             safe_close(clients[i].fd);
     }
-    return 0;
+    return exitcode;
 }
 
 int main(int argc, char *argv[]) {
@@ -606,6 +692,7 @@ int main(int argc, char *argv[]) {
               "[-T <radio-proxy timeout>]", argv[0]);
     }
 
-    handle_telnet_session();
+    int exitcode = handle_telnet_session();
     cout << "Hello world" << endl;
+    return exitcode;
 }
