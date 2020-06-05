@@ -19,6 +19,9 @@ extern "C" {
 using namespace std;
 using namespace std::chrono;
 
+long long sent = 0;
+long long counter = -1;
+
 /**
  * Constant defining biggest possible port number.
  */
@@ -27,7 +30,7 @@ using namespace std::chrono;
 /**
  * Constant defining buffer size used by read function.
  */
-#define BUF_SIZE 8192
+#define BUF_SIZE 1024
 /**
  * Macro defining value of @ref metadata_interval when metadata aren't being sent.
  */
@@ -145,7 +148,7 @@ static int parse_string_to_number(const string &s) {
 /** @brief Parses and checks argument.
  * Return -1 if at least one argument is wrong.
  * @param argc [in]   - number of arguments,
- * @param argv [in]   = array of arguments.
+ * @param argv [in]   - array of arguments.
  * @return Value @p 0 if arguments are correct or -1 if they are wrong.
  */
 static int parse_args(int argc, char *argv[]) {
@@ -426,33 +429,52 @@ static int send_data_to_active_clients(const string &data, int timeout_ms,
     auto it = clients.begin();
 
 
-    while (it != clients.end()) {
-        if (check_if_active &&
-            duration_cast<milliseconds>(start - it->second.second).count() >
-            client_timeout) {
-            auto new_it = clients.erase(it);
-            it = new_it;
-        } else {
-            size_t msg_len = data.size();
-            size_t msg_sent = 0;
-            int timeout_left = timeout_ms;
-            do {
-                set_socket_writing_timeout(timeout_left, sock);
-                auto snda_len = (socklen_t) sizeof(it->second.first);
-
-                auto send_start = high_resolution_clock::now();
-                size_t len = sendto(sock, data.c_str() + msg_sent, data.size() - msg_sent, 0,
-                                    (sockaddr *) &(it->second.first), snda_len);
-                auto send_end = high_resolution_clock::now();
-
-                if (len >= 0)
-                    msg_sent += len;
-                timeout_left -= duration_cast<milliseconds>(
-                        send_end - send_start).count();
-            } while (msg_sent < msg_len && timeout_left > 0);
-            // Ignoring partial write or exceeding timeout.
-            it++;
+    if (check_if_active) {
+        while (it != clients.end()) {
+            if (duration_cast<milliseconds>(start - it->second.second).count() >
+                client_timeout) {
+                // todo debug
+                cerr << "removing client" << endl;
+                auto new_it = clients.erase(it);
+                it = new_it;
+            } else {
+                it++;
+            }
         }
+    }
+    it = clients.begin();
+    while (it != clients.end()) {
+        size_t msg_len = data.size();
+        size_t msg_sent = 0;
+        int timeout_left = timeout_ms;
+        do {
+            set_socket_writing_timeout(timeout_left, sock);
+            auto snda_len = (socklen_t) sizeof(it->second.first);
+
+            auto send_start = high_resolution_clock::now();
+            size_t len = sendto(sock, data.c_str() + msg_sent,
+                                data.size() - msg_sent, 0,
+                                (sockaddr *) &(it->second.first), snda_len);
+            auto send_end = high_resolution_clock::now();
+
+            if (len >= 0) {
+                msg_sent += len;
+                // todo debug
+                if (msg_sent < msg_len)
+                    cerr << "partial send" << endl;
+                if (msg_sent > msg_len)
+                    cerr << "too long msg" << endl;
+            }
+            timeout_left -= duration_cast<milliseconds>(
+                    send_end - send_start).count();
+            // todo debug
+            if (timeout_left <= 0)
+                cerr << "send timeout exceeded" << endl;
+        } while (msg_sent < msg_len && timeout_left > 0);
+        // Ignoring partial write or exceeding timeout.
+        it++;
+        if (check_if_active)
+            sent++;
     }
     auto end = high_resolution_clock::now();
     return duration_cast<milliseconds>(end - start).count();
@@ -672,6 +694,9 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
         syserr("partial / failed write");
 
     do {
+        counter++;
+        // todo debug
+        cerr << "working " << counter << endl;
         client[0].revents = 0;
         client[1].revents = 0;
 
@@ -686,28 +711,6 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
             if (errno != EINTR)
                 syserr("poll");
         } else if (ret > 0) {
-            if (client[0].revents & (POLLIN | POLLERR)) {
-                rval = read(radio_server_sock, BUFFER, BUF_SIZE);
-                string buffer_string(BUFFER, rval);
-                if (rval == 0) {
-                    cerr << "Radio server has closed connection" << endl;
-                    exitcode = 1;
-                } else if (rval > 0) {
-                    //cerr << "server response" << endl;
-                    timeout_used = parse_response(&status, &audio,
-                                                  &remaining_response,
-                                                  buffer_string, &audio_left,
-                                                  radio_proxy_sock);
-                    if (timeout_used < 0)
-                        exitcode = 1;
-                    else
-                        exitcode = 0;
-                } else {
-                    // read failed, reducing possible timeout.
-                    timeout_used += duration_cast<milliseconds>(
-                            end_poll_timeout - start_poll_timeout).count();
-                }
-            }
             if (client[1].fd != -1 &&
                 (client[1].revents & (POLLIN | POLLERR))) {
                 rcva_len = (socklen_t) sizeof(client_addr);
@@ -743,6 +746,8 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
                             search->second.second = end_poll_timeout;
                         }
                         if (msg_type == DISCOVER) {
+                            // todo debug
+                            cerr << "receiving DISCOVER" << endl;
                             string iam_response = create_msg_to_client(IAM,
                                                                        radio_name);
                             if (server_timeout - timeout_used >= 500) {
@@ -761,11 +766,36 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
                             auto end = high_resolution_clock::now();
                             timeout_used += duration_cast<milliseconds>(
                                     end - start).count();
+                        } else {
+                            // todo debug
+                            cerr << "receiving KEEPALIVE" << endl;
                         }
                     }
                     // Ignoring message of wrong type.
                 }
                 // Ignoring too short message or reading failure.
+            }
+            if (client[0].revents & (POLLIN | POLLERR)) {
+                rval = read(radio_server_sock, BUFFER, BUF_SIZE);
+                string buffer_string(BUFFER, rval);
+                if (rval == 0) {
+                    cerr << "Radio server has closed connection" << endl;
+                    exitcode = 1;
+                } else if (rval > 0) {
+                    //cerr << "server response" << endl;
+                    timeout_used += parse_response(&status, &audio,
+                                                  &remaining_response,
+                                                  buffer_string, &audio_left,
+                                                  radio_proxy_sock);
+                    if (timeout_used < 0)
+                        exitcode = 1;
+                    else
+                        exitcode = 0;
+                } else {
+                    // read failed, reducing possible timeout.
+                    timeout_used += duration_cast<milliseconds>(
+                            end_poll_timeout - start_poll_timeout).count();
+                }
             }
         } else {
             cerr << "Radio server timeout exceeded" << endl;
@@ -806,5 +836,7 @@ int main(int argc, char *argv[]) {
         if (close(udp_sock) < 0)
             syserr("close");
     }
+    // todo debug
+    cerr << sent << endl;
     return exitcode;
 }
