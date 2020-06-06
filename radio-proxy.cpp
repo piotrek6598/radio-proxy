@@ -1,3 +1,48 @@
+/** @file
+ * Radio-proxy program downloads music from given radio server and plays it
+ * or redirects it further receivers. Program enables also downloading
+ * of basic metadata. Program works in two modes, player and proxy mode.
+ *
+ * In player mode program prints downloaded audio to stdout and downloaded
+ * metadata to stderr. Usage is:<br>
+ * ./radio-proxy params<br>
+ *
+ * Params: <br>
+ * -h   radio server name or address, required. <br>
+ * -r   resource to download from radio server, required. <br>
+ * -p   port number at server where audio is available, required.<br>
+ * -m   metadata request, possible values are yes|no, optional, default is no.<br>
+ * -t   timeout after which server is treated as unavailable, optional, default is 5s.<br>
+ *
+ * example usage:<br>
+ * ./radio-proxy -h waw02-03.ic.smcdn.pl -r /t050-1.mp3 -p 8000<br>
+ *
+ * In proxy mode, downloaded audio and metadata are redirected to connected receivers.
+ * Usage is:<br>
+ * ./radio-proxy params<br>
+ *
+ * Additional params are:<br>
+ * -P   port number, where clients can connect, required.<br>
+ * -B   listening multicast address, optional.<br>
+ * -T   timeout after proxy doesn't send anything to client, optional, default is 5s.<br>
+ *
+ * example usage:<br>
+ * ./radio-proxy -h waw02-03.ic.smcdn.pl -r /t050-1.mp3 -p 8000 -P 10000 -t 10<br>
+ *
+ * Connection between radio-proxy and radio server is made on TCP basis with
+ * SHOUTcast (ICY) protocol, but data are transferred to clients on UDP basis.
+ *
+ * Program finishes work where SIGINT is received or radio server is unavailable.
+ * Program terminates with exitcode 1, if wrong params are given, occurred any
+ * error which makes further work impossible. In case of failure associated
+ * message is printed to stderr.
+ *
+ * Detailed communication protocol is available at todo.
+ *
+ * @author Piotr Jasinski <jasinskipiotr99@gmail.com>
+ * @date 07.06.2020
+ */
+
 #include <iostream>
 #include <unordered_map>
 #include <cstring>
@@ -19,67 +64,82 @@ extern "C" {
 using namespace std;
 using namespace std::chrono;
 
-/**
- * Constant defining biggest possible port number.
- */
+/** Constant defining biggest possible port number. */
 #define MAX_PORT_NUM 65535
 
-/**
- * Constant defining buffer size used by read function.
- */
+/** Constant defining buffer size used by read function. */
 #define BUF_SIZE 1024
-/**
- * Macro defining value of @ref metadata_interval when metadata aren't being sent.
- */
+
+/** Macro defining value of @ref metadata_interval when metadata aren't being sent. */
 #define NO_METADATA -1
 
-/**
- * Macros defining types of clients' messages in proxy mode.
+/** @name Clients' message type.
+ * Macros defining types of clients' message type in proxy mode.
  */
+//@{
 #define DISCOVER 1
 #define IAM 2
 #define KEEPALIVE 3
 #define AUDIO 4
 #define METADATA 6
+//@}
 
-/**
- * Maps where keys are like '-P', '-h' and represent possible program arguments.
- * Values represent number of argument occurrences in program argument list.
+
+/** @name Player mode params
+ * Arguments defining details of connection to radio server.
  */
-unordered_map<string, int> req_args;
-unordered_map<string, int> opt_args;
-unordered_map<string, int> proxy_opt_args;
-
-// Arguments defining details of connection to radio server.
+ //@{
+ /** Radio server name. */
 string host_name;
+/** Resource to download in radio server. */
 string resource_name;
+/** Port number where resource is available.*/
 int port_num;
+/** Flag indicating if metadata are requested. */
 bool metadata_request;
+/** Radio server timeout in milliseconds. */
 int server_timeout;
+//@}
 
-// Arguments defining details of connection to clients in proxy mode.
+/** @name Proxy mode params.
+ * Arguments defining details of connection to clients in proxy mode.
+ */
+ //@{
+ /** Port number where clients can connect. */
 int proxy_port_num;
+/** Possible multicast address, empty if not set. */
 string multicast_address;
+/** Time of client's inactivity after proxy stops to send anything. */
 int client_timeout;
+//@}
 
-// Name of transmitted radio.
+/** @name Radio description.
+ * Description of transmitted radio.
+ */
+//@{
+/** Radio name. */
 static string radio_name;
+/** Last not empty received metadata. */
 string last_metadata_received;
+//@}
 
-// Structure describing proxy multicast group.
+/** @name Connection details.
+ * Variables storing connection details.
+ */
+ //@{
+/** Structure describing proxy multicast group. */
 ip_mreq multicast_group;
-
-// Current writing timeout on clients' socket.
+/** Current writing timeout on clients' socket. */
 int clients_socket_current_timeout;
-
-// Structure describing proxy own address.
+/** Structure describing proxy own address. */
 sockaddr_in radio_proxy_addr;
+//@}
 
-// Variable defining when program should finish work.
+/** Flag indicating that program should finish work. */
 static bool finish_work = false;
 
-// Size of audio block between two metadata blocks.
-int metadata_interval = NO_METADATA;
+/** Global variable defining number of bytes between two metadata blocks. */
+static int metadata_interval = NO_METADATA;
 
 /**
  * Map of active clients is updated every time data are sent or new client appears.
@@ -104,13 +164,6 @@ static void catch_int(int signal) {
 static void setup() {
     struct sigaction action{};
     sigset_t block_mask;
-    req_args.insert({"-h", 0});
-    req_args.insert({"-r", 0});
-    req_args.insert({"-p", 0});
-    opt_args.insert({"-m", 0});
-    opt_args.insert({"-t", 0});
-    proxy_opt_args.insert({"-B", 0});
-    proxy_opt_args.insert({"-T", 0});
 
     clients_socket_current_timeout = 0;
     metadata_request = false;
@@ -154,6 +207,18 @@ static int parse_string_to_number(const string &s) {
  * @return Value @p 0 if arguments are correct or -1 if they are wrong.
  */
 static int parse_args(int argc, char *argv[]) {
+    unordered_map<string, int> req_args;
+    unordered_map<string, int> opt_args;
+    unordered_map<string, int> proxy_opt_args;
+
+    req_args.insert({"-h", 0});
+    req_args.insert({"-r", 0});
+    req_args.insert({"-p", 0});
+    opt_args.insert({"-m", 0});
+    opt_args.insert({"-t", 0});
+    proxy_opt_args.insert({"-B", 0});
+    proxy_opt_args.insert({"-T", 0});
+
     if (argc < 7 || argc % 2 == 0)
         return -1;
 
@@ -312,8 +377,6 @@ static int add_multicast_membership(int sock) {
 /** @brief Creates socket which clients can connect.
  * Creates a socket enabling communication with clients via UDP.
  * If connection is impossible terminates program with exitcode 1.
- * @param server [in]   - server name,
- * @param port [in]     - port number.
  * @return Socket descriptor.
  */
 static int create_proxy_socket() {
@@ -423,7 +486,7 @@ static void set_socket_writing_timeout(int timeout_ms, int sock) {
 
 /** @brief Sends data received from radio server to active clients.
  * If requested, checks every client if he is still active. Client is treated
- * as active if he sent @ref DISCOVER or @ref KEEPALIVE message in last
+ * as active if he sent 'DISCOVER' or 'KEEPALIVE' message in last
  * @ref client_timeout milliseconds.
  * @param data            [in]   - data to send,
  * @param timeout_ms      [in]   - timeout per single send,
@@ -567,6 +630,8 @@ static int sending_or_printing_data(const string &audio_stream,
  *                                        converted to string.
  * @param audio_left [in,out]           - pointer to number of audio data which
  *                                        come before next metadata block.
+ * @param sock [in]                     - socket where data should be written,
+ *                                        -1 if player mode is selected.
  * @return If error occurred value @p -1. Otherwise duration of sending data
  * in milliseconds if @p sock is not -1 or 0 if @p sock is -1.
  */
@@ -680,7 +745,9 @@ static int parse_response(bool *status, bool *audio, string *remaining_response,
 /** @brief Receives, parse and write further data.
  * Terminates immediately program with exitcode 1 if critical error occurred.
  * Returns 1 if program has to finish work due to error, otherwise 0.
- * @param radio_server_sock [in]   - radio_server_sock descriptor from which data are read.
+ * @param radio_server_sock [in]   - socket used to communicate with radio server,
+ * @param radio_proxy_sock [in]    - socket used to communicate with clients,
+ *                                   -1 if player mode is selected.
  * @return Value @p 1 if program has to finish work due to error, otherwise
  * value @p 0.
  */
@@ -818,6 +885,14 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
     return exitcode;
 }
 
+/** @brief Runs radio-proxy.
+ * If any error occurred which makes further work impossible and program
+ * didn't terminate before, returns 1. Detailed usage is described in todo.
+ * Finishes work after SIGINT was received or error occurred.
+ * @param argc [in]   - number of arguments,
+ * @param argv [in]   - array of arguments.
+ * @return Value @p 0 in case of success, otherwise value @p 1.
+ */
 int main(int argc, char *argv[]) {
     int udp_sock;
 
