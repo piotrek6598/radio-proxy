@@ -64,10 +64,12 @@ using namespace std::chrono;
 unordered_map<string, int> req_args;
 
 /**
- * Vector of radio proxies found and presented in menu, with proxy address.
+ * Vector of radio proxies found and presented in menu, with proxy address and
+ * last received metadata.
  */
 vector<string> radio_proxy_names;
 vector<sockaddr_in> radio_proxy_addrs;
+vector<string> radios_metadata;
 
 /**
  * Values of program required arguments.
@@ -489,7 +491,7 @@ static int safe_menu_telnet_write(int *sock) {
  * @return Value @p 0 on success, otherwise value @p -1.
  */
 static int safe_telnet_write(int *sock, const string &data) {
-    if (write(*sock, data.c_str(), data.size()) != (ssize_t)data.size()) {
+    if (write(*sock, data.c_str(), data.size()) != (ssize_t) data.size()) {
         restore_telnet_cursor(*sock);
         safe_close(*sock);
         *sock = -1;
@@ -674,6 +676,8 @@ static int handle_telnet_session() {
                                 write_typemsg_to_proxy_socket(clients[2].fd,
                                                               DISCOVER,
                                                               proxy_addr);
+                                safe_metadata_telnet_write(&clients[1].fd,
+                                                           radios_metadata[proxy_choice]);
                                 // scheduling timeouts
                                 proxy_timeout_left = timeout;
                                 keepalive_timeout_left = KEEPALIVE_TIMEOUT_VAL;
@@ -720,12 +724,29 @@ static int handle_telnet_session() {
 
                     if (type == IAM) {
                         // Adding new proxy to menu.
+                        string::size_type metadata_pos = response.find(
+                                "MetaDataIncluded:");
+                        string radio_name;
+                        string radio_metadata;
+                        if (metadata_pos == string::npos) {
+                            // There is no metadata.
+                            radio_name = response;
+                        } else {
+                            radio_name = response.substr(0, metadata_pos);
+                            radio_metadata = response.substr(metadata_pos + 17);
+                        }
+
                         if (proxy_num == -1) {
-                            radio_proxy_names.push_back(response);
-                            if (safe_menu_telnet_write(&clients[1].fd) != 0)
+                            radio_proxy_names.push_back(radio_name);
+                            if (safe_menu_telnet_write(&clients[1].fd) != 0) {
                                 radio_proxy_names.pop_back();
-                            else
+                            } else {
                                 radio_proxy_addrs.push_back(srvr_addr);
+                                radios_metadata.push_back(radio_metadata);
+                            }
+                        } else {
+                            safe_metadata_telnet_write(&clients[1].fd,
+                                                       radio_metadata);
                         }
                     }
 
@@ -746,6 +767,7 @@ static int handle_telnet_session() {
                         string metadata = parse_stream_msg(len, response,
                                                            clients[2].fd);
                         safe_metadata_telnet_write(&clients[1].fd, metadata);
+                        radios_metadata[proxy_num] = metadata;
                         // timeouts update
                         if (update_timeouts) {
                             proxy_timeout_left = timeout;
@@ -771,6 +793,8 @@ static int handle_telnet_session() {
                             radio_proxy_names.cbegin() + proxy_choice);
                     radio_proxy_addrs.erase(
                             radio_proxy_addrs.cbegin() + proxy_choice);
+                    radios_metadata.erase(
+                            radios_metadata.cbegin() + proxy_choice);
                     proxy_choice = -1;
                     // proxy_choice = -1 implies that timeouts are disabled.
                     // printing new menu

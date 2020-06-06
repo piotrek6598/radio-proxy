@@ -64,6 +64,7 @@ int client_timeout;
 
 // Name of transmitted radio.
 static string radio_name;
+string last_metadata_received;
 
 // Structure describing proxy multicast group.
 ip_mreq multicast_group;
@@ -460,8 +461,8 @@ static int send_data_to_active_clients(const string &data, int timeout_ms,
 
             auto send_start = high_resolution_clock::now();
             ssize_t len = sendto(sock, data.c_str() + msg_sent,
-                                data.size() - msg_sent, 0,
-                                (sockaddr *) &(it->second.first), snda_len);
+                                 data.size() - msg_sent, 0,
+                                 (sockaddr *) &(it->second.first), snda_len);
             auto send_end = high_resolution_clock::now();
 
             if (len >= 0)
@@ -494,6 +495,24 @@ static string create_msg_to_client(uint16_t type, const string &data) {
     string msg(msg_header, 4);
     msg.append(data);
     return msg;
+}
+
+/** @brief Creates IAM response.
+ * Response contains radio name and last not empty metadata separated
+ * by 'MetaDataIncluded:'. If radio doesn't transmit metadata or proxy didn't
+ * receive not empty metadata, response contains only radio name.
+ * @param radio [in]      - radio name,
+ * @param metadata [in]   - last not empty metadata.
+ * @return IAM response.
+ */
+static string create_iam_response(string radio, const string &metadata) {
+    string resp;
+    if (metadata.empty())
+        return radio;
+    resp.append(radio);
+    resp.append("MetaDataIncluded:");
+    resp.append(metadata);
+    return resp;
 }
 
 /** @brief Sends data to clients.
@@ -633,7 +652,7 @@ static int parse_response(bool *status, bool *audio, string *remaining_response,
             audio_stream.append(response.substr(0, *audio_left));
             response = response.substr(*audio_left);
             assert(!response.empty());
-            unsigned metadata_block_len = ((unsigned ) response[0]) * 16;
+            unsigned metadata_block_len = ((unsigned) response[0]) * 16;
             if (response.size() < metadata_block_len + 1) {
                 // Metadata block is broken in the middle.
                 *remaining_response = response;
@@ -641,7 +660,10 @@ static int parse_response(bool *status, bool *audio, string *remaining_response,
                 return sending_or_printing_data(audio_stream, meta_stream,
                                                 sock);
             } else {
-                meta_stream.append(response.substr(1, metadata_block_len));
+                string curr_metadata = response.substr(1, metadata_block_len);
+                if (!curr_metadata.empty())
+                    last_metadata_received = curr_metadata;
+                meta_stream.append(curr_metadata);
                 *audio_left = metadata_interval;
                 response = response.substr(metadata_block_len + 1);
             }
@@ -687,7 +709,7 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
     string request = create_radio_request();
 
     if (write(radio_server_sock, request.c_str(), request.size()) !=
-            (int) request.size())
+        (int) request.size())
         syserr("partial / failed write");
 
     do {
@@ -727,7 +749,8 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
                     uint16_t msg_type = ntohs(msg_type_bytes);
                     uint16_t msg_len = ntohs(msg_len_bytes);
 
-                    if ((msg_type == DISCOVER || msg_type == KEEPALIVE) && msg_len == 0) {
+                    if ((msg_type == DISCOVER || msg_type == KEEPALIVE) &&
+                        msg_len == 0) {
                         // Updating client activity timestamp.
                         auto search = clients.find(cl_addr);
                         if (search == clients.end()) {
@@ -737,8 +760,11 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
                             search->second.second = end_poll_timeout;
                         }
                         if (msg_type == DISCOVER) {
-                            string iam_response = create_msg_to_client(IAM,
-                                                                       radio_name);
+                            string iam_response;
+                            iam_response = create_msg_to_client(IAM,
+                                                                create_iam_response(
+                                                                        radio_name,
+                                                                        last_metadata_received));
                             if (server_timeout - timeout_used >= 500) {
                                 set_socket_writing_timeout(500,
                                                            radio_proxy_sock);
@@ -769,9 +795,9 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
                     exitcode = 1;
                 } else if (rval > 0) {
                     timeout_used += parse_response(&status, &audio,
-                                                  &remaining_response,
-                                                  buffer_string, &audio_left,
-                                                  radio_proxy_sock);
+                                                   &remaining_response,
+                                                   buffer_string, &audio_left,
+                                                   radio_proxy_sock);
                     if (timeout_used < 0)
                         exitcode = 1;
                     else
