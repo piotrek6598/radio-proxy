@@ -1,3 +1,29 @@
+/** @file
+ * Radio-client program connects to radio-proxy and plays received audio. Radio-client is controlled
+ * by telnet client. Connection with telnet is made on TCP basis. Radio-client sends menu to telnet
+ * which enables control of one's self. Usage is: <br>
+ * ./radio-client params <br>
+ *
+ * Params: <br>
+ * -H   radio-proxy address, multicast address or broadcast address, required. <br>
+ * -P   radio-proxy UDP port number, required. <br>
+ * -p   port number, where telnet can connect, required. <br>
+ * -T   timeout after which radio-proxy is treated as unavailable, optional, default is 5s. <br>
+ *
+ * Example usage: <br>
+ * ./radio-client -H 255.255.255.255 -P 10000 -p 20000 -t 10 <br>
+ *
+ * Program finishes work where SIGINT is received or telnet client requested it.
+ * Program terminates with exitcode 1, if wrong params are given, occurred any
+ * error which makes further work impossible. In case of failure associated
+ * message is printed to stderr.
+ *
+ * Detailed communication protocol is available at TODO.
+ *
+ * @author Piotr Jasinski <jasinskipiotr99@gmail.com>
+ * @date 11.06.2020
+ */
+
 #include <iostream>
 #include <unordered_map>
 #include <cstring>
@@ -26,33 +52,39 @@ const int MAX_PORT_NUM = 65535;
  */
 const int BUF_SIZE = 8192;
 
-/**
+/** @name ANSI Escape Codes.
  * Macros defining ASCII Escape Code for clearing line and cursor move.
  */
+//@{
 #define clear_line "\033[0K"
 #define move_down "\033[1B"
 #define move_up "\033[1A"
+//@}
 
-/**
+/** @name Flags indicating which timeout should by updated.
  * Macros defining which timeouts should be updated.
  */
+//@{
 #define PROXY_TIMEOUT 1
 #define KEEPALIVE_TIMEOUT 2
 #define ALL_TIMEOUTS 3
+//@}
 
 /**
  * Constant defining how often KEEPALIVE message is sent. Value is milliseconds.
  */
 const int KEEPALIVE_TIMEOUT_VAL = 3500;
 
-/**
- * Macros defining types of clients' messages in proxy mode.
+/** @name Clients' message type.
+ * Macros defining types of clients' message type in proxy mode.
  */
+//@{
 #define DISCOVER 1
 #define IAM 2
 #define KEEPALIVE 3
 #define AUDIO 4
 #define METADATA 6
+//@}
 
 using namespace std;
 using namespace std::chrono;
@@ -63,60 +95,60 @@ using namespace std::chrono;
  */
 unordered_map<string, int> req_args;
 
-/**
+/** @name Details of found radio-proxy.
  * Vector of radio proxies found and presented in menu, with proxy address and
  * last received metadata.
  */
+//@{
+/** Vector containing name of radio transmitted by radio-proxy. */
 vector<string> radio_proxy_names;
+/** Vector containing address of radio proxy. */
 vector<sockaddr_in> radio_proxy_addrs;
+/** Vector containing last metadata received from radio-proxy. */
 vector<string> radios_metadata;
+//@}
 
-/**
- * Values of program required arguments.
+/** @name Radio client required arguments.
+ * Arguments defining connection details.
  */
+//@{
+/** Address where radio-client send request to find active radio-proxy. */
 string host_addr;
+/** Port number on which radio-proxy listen. */
 int radio_proxy_port;
+/** Port number where telnet client can connect. */
 int telnet_port;
+//@}
 
-/**
- * Time in milliseconds after which proxy is treated as not working.
- */
-int timeout = -1;
+/** Radio proxy timeout in milliseconds. */
+int timeout;
 
-/**
- * Remaining time to send next KEEPALIVE message.
- */
+/** Remaining time to send next KEEPALIVE message. */
 int keepalive_timeout_left = KEEPALIVE_TIMEOUT_VAL;
 
-/**
- * Remaining time to treat proxy as not working.
- */
+/** Remaining time to treat proxy as inactive. */
 int proxy_timeout_left;
 
-/**
- * True if @ref proxy_timeout_left < @ref keepalive_timeout_left.
+/** Flag indicating which timeout is smaller, true if
+ * @ref proxy_timeout_left < @ref keepalive_timeout_left.
  */
 bool proxy_timeout_selected;
 
-/**
- * Position of selected proxy in menu list, -1 if no proxy is selected.
- */
-int proxy_choice = -1;
+/** Position of selected proxy in menu list, -1 if proxy is not selected. */
+int proxy_choice;
 
-/**
- * Menu size (in lines) and line with cursor number (starting from 1).
- */
-size_t menu_lines_count = 0;
-size_t telnet_curr_line = 1;
+/**  Menu size (in lines). */
+size_t menu_lines_count;
+/** Number of line with cursor (starting from 1). */
+size_t telnet_curr_line;
 
-/**
- * Last metadata printed in menu.
- */
+/** Last metadata printed in menu. */
 string metadata_printed;
 
-// Variable defining when program should finish work.
+/** Flag indicating that program should finish work. */
 static bool finish_work = false;
 
+/** Buffer where data from radio-proxy are temporally stored. */
 char BUFFER[BUF_SIZE];
 
 /** @brief Signal handler.
@@ -137,6 +169,11 @@ static void setup() {
     req_args.insert({"-P", 0});
     req_args.insert({"-H", 0});
     req_args.insert({"-p", 0});
+
+    timeout = -1;
+    proxy_choice = -1;
+    menu_lines_count = 0;
+    telnet_curr_line = 1;
 
     sigemptyset(&block_mask);
     action.sa_handler = catch_int;
@@ -211,6 +248,7 @@ static int parse_args(int argc, char *argv[]) {
         }
     }
 
+    // Checks if all required arguments appeared exactly ones.
     for (auto &req_arg : req_args) {
         if (req_arg.second != 1)
             return -1;
@@ -267,15 +305,13 @@ static string parse_stream_msg(uint16_t len, string &response, int sock) {
             timeval curr_timeval{};
             tmp_timeval.tv_sec = 0;
             tmp_timeval.tv_usec = 1000;
+
             socklen_t curr_size;
-            getsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (void *) &curr_timeval,
-                       &curr_size);
-            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (void *) &tmp_timeval,
-                       sizeof(tmp_timeval));
-            rval = recvfrom(sock, BUFFER, m, 0, (sockaddr *) &srvr_addr,
-                            &rcva_len);
-            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (void *) &curr_timeval,
-                       sizeof(curr_timeval));
+
+            getsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (void *) &curr_timeval, &curr_size);
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (void *) &tmp_timeval, sizeof(tmp_timeval));
+            rval = recvfrom(sock, BUFFER, m, 0, (sockaddr *) &srvr_addr, &rcva_len);
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (void *) &curr_timeval, sizeof(curr_timeval));
 
             if (rval > 0) {
                 string new_response(BUFFER, rval);
@@ -290,7 +326,7 @@ static string parse_stream_msg(uint16_t len, string &response, int sock) {
 }
 
 /** @brief Select poll timeout.
- * @return Lowest of @ref proxy_timeout_left and @ref keeepalive_timeout_left,
+ * @return Lowest of @ref proxy_timeout_left and @p keeepalive_timeout_left,
  * or -1 if proxy wasn't selected.
  */
 static int get_next_timeout() {
@@ -315,8 +351,7 @@ static void decrease_timeouts(int timeouts_type, int timeout_ms) {
     }
 
     proxy_timeout_left = proxy_timeout_left > 0 ? proxy_timeout_left : 0;
-    keepalive_timeout_left =
-            keepalive_timeout_left > 0 ? keepalive_timeout_left : 0;
+    keepalive_timeout_left = keepalive_timeout_left > 0 ? keepalive_timeout_left : 0;
 }
 
 /** @brief Send empty message to proxy.
@@ -326,12 +361,10 @@ static void decrease_timeouts(int timeouts_type, int timeout_ms) {
  * @param msg_type [in]   - message type,
  * @param addr [in]       - proxy's address.
  */
-static void write_typemsg_to_proxy_socket(int socket, int msg_type,
-                                          sockaddr_in addr) {
+static void write_typemsg_to_proxy_socket(int socket, int msg_type, sockaddr_in addr) {
     string s = create_msg_to_client(msg_type, "");
     auto rcva_len = (socklen_t) sizeof(addr);
-    ssize_t snd_len = sendto(socket, s.c_str(), s.size(), 0, (sockaddr *) &addr,
-                             rcva_len);
+    ssize_t snd_len = sendto(socket, s.c_str(), s.size(), 0, (sockaddr *) &addr, rcva_len);
     if (snd_len != (ssize_t) s.size())
         syserr("partial / failed write");
 }
@@ -357,11 +390,13 @@ static string clearing_current_menu() {
     string clear_menu;
     for (size_t i = telnet_curr_line; i < menu_lines_count; i++)
         clear_menu.append(move_down);
+
     if (!metadata_printed.empty()) {
         clear_menu.append(move_down);
         clear_menu.append(clear_line);
         clear_menu.append(move_up);
     }
+
     for (size_t i = menu_lines_count; i > 0; i--) {
         clear_menu.append(clear_line);
         if (i != 1)
@@ -377,7 +412,9 @@ static string clearing_current_menu() {
  */
 static int send_menu_to_telnet(int telnet_sock) {
     string menu = clearing_current_menu();
+
     menu.append("Szukaj pośrednika\r\n");
+
     for (size_t i = 0; i < radio_proxy_names.size(); i++) {
         menu.append("Pośrednik ");
         menu.append(radio_proxy_names[i]);
@@ -385,13 +422,17 @@ static int send_menu_to_telnet(int telnet_sock) {
             menu.append(" *");
         menu.append("\r\n");
     }
+
     menu.append("Koniec\r\n");
+
     if (proxy_choice != -1 && !metadata_printed.empty()) {
         menu.append(metadata_printed);
         menu.append("\r\n");
         menu.append(move_up);
     }
+
     menu_lines_count = radio_proxy_names.size() + 2;
+
     for (size_t i = 0; i < menu_lines_count; i++)
         menu.append(move_up);
 
@@ -408,20 +449,26 @@ static int send_menu_to_telnet(int telnet_sock) {
  */
 static int send_metadata_to_telnet(int telnet_sock, const string &data) {
     string msg;
+
     for (size_t i = telnet_curr_line; i <= menu_lines_count; i++)
         msg.append(move_down);
+
     if (!metadata_printed.empty())
         msg.append(clear_line);
+
     msg.append(data);
     msg.append("\r");
+
     for (size_t i = telnet_curr_line; i <= menu_lines_count; i++)
         msg.append(move_up);
     if (data.find('\n') != string::npos)
         msg.append(move_up);
+
     int ret = write_msg_to_telnet(telnet_sock, msg);
-    if (ret == 0) {
+
+    if (ret == 0)
         metadata_printed = data;
-    }
+
     return ret;
 }
 
@@ -453,14 +500,15 @@ static void restore_telnet_cursor(int sock) {
 static int get_proxy_list_num(sockaddr_in srvr_addr) {
     for (size_t i = 0; i < radio_proxy_addrs.size(); i++) {
         if (srvr_addr.sin_addr.s_addr == radio_proxy_addrs[i].sin_addr.s_addr &&
-            srvr_addr.sin_port == radio_proxy_addrs[i].sin_port)
+            srvr_addr.sin_port == radio_proxy_addrs[i].sin_port) {
             return i;
+        }
     }
     return -1;
 }
 
 /**
- * Reset variables describin menu state.
+ * Reset variables describing menu state.
  */
 static void reset_lines_counter() {
     menu_lines_count = 0;
@@ -571,12 +619,10 @@ static int handle_telnet_session() {
     if (sock < 0)
         syserr("socket");
     int optval = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (void *) &optval,
-                   sizeof optval) < 0)
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (void *) &optval, sizeof optval) < 0)
         syserr("broadcast");
     optval = 64;
-    if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, (void *) &optval,
-                   sizeof optval) < 0)
+    if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, (void *) &optval, sizeof optval) < 0)
         syserr("multicast ttl");
 
 
@@ -594,8 +640,7 @@ static int handle_telnet_session() {
     telnet_server.sin_family = AF_INET;
     telnet_server.sin_addr.s_addr = htonl(INADDR_ANY);
     telnet_server.sin_port = htons(telnet_port);
-    if (bind(clients[0].fd, (sockaddr *) &telnet_server,
-             (socklen_t) sizeof(telnet_server)) < 0)
+    if (bind(clients[0].fd, (sockaddr *) &telnet_server, (socklen_t) sizeof(telnet_server)) < 0)
         syserr("Binding stream socket");
 
     if (listen(clients[0].fd, 5) == -1)
@@ -619,8 +664,7 @@ static int handle_telnet_session() {
         } else if (ret > 0) {
             if (!finish_work && (clients[0].revents & POLLIN)) {
                 // Accepting telnet connection.
-                msg_sock = accept(clients[0].fd, (sockaddr *) nullptr,
-                                  (socklen_t *) nullptr);
+                msg_sock = accept(clients[0].fd, (sockaddr *) nullptr, (socklen_t *) nullptr);
                 if (msg_sock == -1) {
                     syserr("accept");
                 } else {
@@ -665,17 +709,13 @@ static int handle_telnet_session() {
                                 finish_work = true;
                             } else if (telnet_curr_line == 1) {
                                 // Szukaj posrednika selected.
-                                write_typemsg_to_proxy_socket(clients[2].fd,
-                                                              DISCOVER,
-                                                              my_addr);
+                                write_typemsg_to_proxy_socket(clients[2].fd, DISCOVER, my_addr);
                             } else {
                                 // Proxy was chosen.
                                 proxy_choice = (int) telnet_curr_line - 2;
                                 sockaddr_in proxy_addr = radio_proxy_addrs[proxy_choice];
                                 safe_menu_telnet_write(&clients[1].fd);
-                                write_typemsg_to_proxy_socket(clients[2].fd,
-                                                              DISCOVER,
-                                                              proxy_addr);
+                                write_typemsg_to_proxy_socket(clients[2].fd, DISCOVER, proxy_addr);
                                 safe_metadata_telnet_write(&clients[1].fd,
                                                            radios_metadata[proxy_choice]);
                                 // scheduling timeouts
@@ -709,8 +749,7 @@ static int handle_telnet_session() {
                 (clients[2].revents) & (POLLIN | POLLERR)) {
                 // Message from proxy was received.
                 rcva_len = sizeof(srvr_addr);
-                rval = recvfrom(clients[2].fd, BUFFER, BUF_SIZE, 0,
-                                (sockaddr *) &srvr_addr,
+                rval = recvfrom(clients[2].fd, BUFFER, BUF_SIZE, 0, (sockaddr *) &srvr_addr,
                                 &rcva_len);
                 if (rval >= 4) {
                     uint16_t msg_type;
@@ -724,8 +763,7 @@ static int handle_telnet_session() {
 
                     if (type == IAM) {
                         // Adding new proxy to menu.
-                        string::size_type metadata_pos = response.find(
-                                "MetaDataIncluded:");
+                        string::size_type metadata_pos = response.find("MetaDataIncluded:");
                         string radio_name;
                         string radio_metadata;
                         if (metadata_pos == string::npos) {
@@ -733,7 +771,8 @@ static int handle_telnet_session() {
                             radio_name = response;
                         } else {
                             radio_name = response.substr(0, metadata_pos);
-                            radio_metadata = response.substr(metadata_pos + 17);
+                            radio_metadata = response.substr(
+                                    metadata_pos + strlen("MetaDataIncluded:"));
                         }
 
                         if (proxy_num == -1) {
@@ -745,8 +784,7 @@ static int handle_telnet_session() {
                                 radios_metadata.push_back(radio_metadata);
                             }
                         } else {
-                            safe_metadata_telnet_write(&clients[1].fd,
-                                                       radio_metadata);
+                            safe_metadata_telnet_write(&clients[1].fd, radio_metadata);
                         }
                     }
 
@@ -757,23 +795,20 @@ static int handle_telnet_session() {
                         // timeouts updating
                         proxy_timeout_left = timeout;
                         decrease_timeouts(KEEPALIVE_TIMEOUT,
-                                          duration_cast<milliseconds>(
-                                                  end - start).count());
+                                          duration_cast<milliseconds>(end - start).count());
                         update_timeouts = false;
                     }
 
                     if (type == METADATA && proxy_num >= 0 &&
                         proxy_num == proxy_choice) {
-                        string metadata = parse_stream_msg(len, response,
-                                                           clients[2].fd);
+                        string metadata = parse_stream_msg(len, response, clients[2].fd);
                         safe_metadata_telnet_write(&clients[1].fd, metadata);
                         radios_metadata[proxy_num] = metadata;
                         // timeouts update
                         if (update_timeouts) {
                             proxy_timeout_left = timeout;
                             decrease_timeouts(KEEPALIVE_TIMEOUT,
-                                              duration_cast<milliseconds>(
-                                                      end - start).count());
+                                              duration_cast<milliseconds>(end - start).count());
                             update_timeouts = false;
                         }
                     }
@@ -783,18 +818,14 @@ static int handle_telnet_session() {
 
             // updating timeouts if not done before
             if (update_timeouts)
-                decrease_timeouts(ALL_TIMEOUTS, duration_cast<milliseconds>(
-                        end - start).count());
+                decrease_timeouts(ALL_TIMEOUTS, duration_cast<milliseconds>(end - start).count());
         } else {
             if (update_timeouts) {
                 if (proxy_timeout_selected) {
                     // disabling proxy
-                    radio_proxy_names.erase(
-                            radio_proxy_names.cbegin() + proxy_choice);
-                    radio_proxy_addrs.erase(
-                            radio_proxy_addrs.cbegin() + proxy_choice);
-                    radios_metadata.erase(
-                            radios_metadata.cbegin() + proxy_choice);
+                    radio_proxy_names.erase(radio_proxy_names.cbegin() + proxy_choice);
+                    radio_proxy_addrs.erase(radio_proxy_addrs.cbegin() + proxy_choice);
+                    radios_metadata.erase(radios_metadata.cbegin() + proxy_choice);
                     proxy_choice = -1;
                     // proxy_choice = -1 implies that timeouts are disabled.
                     // printing new menu
@@ -803,12 +834,10 @@ static int handle_telnet_session() {
                 } else {
                     // sending KEEPALIVE
                     sockaddr_in proxy_addr = radio_proxy_addrs[proxy_choice];
-                    write_typemsg_to_proxy_socket(clients[2].fd, KEEPALIVE,
-                                                  proxy_addr);
+                    write_typemsg_to_proxy_socket(clients[2].fd, KEEPALIVE, proxy_addr);
                     // updating timeouts
                     decrease_timeouts(PROXY_TIMEOUT,
-                                      duration_cast<milliseconds>(
-                                              end - start).count());
+                                      duration_cast<milliseconds>(end - start).count());
                     keepalive_timeout_left = KEEPALIVE_TIMEOUT_VAL;
                 }
             } else {
@@ -829,6 +858,14 @@ static int handle_telnet_session() {
     return exitcode;
 }
 
+/** @brief Runs radio-client.
+ * If any error occurred which makes further work impossible and program
+ * didn't terminate before, returns 1. Detailed usage is described in TODO.
+ * Finishes work after SIGINT or telnet request was received or error occurred.
+ * @param argc [in]   - number of arguments,
+ * @param argv [in]   - array of arguments.
+ * @return Value @p 0 in case of success, otherwise value @p 1.
+ */
 int main(int argc, char *argv[]) {
     setup();
     if (parse_args(argc, argv) != 0) {

@@ -14,7 +14,7 @@
  * -m   metadata request, possible values are yes|no, optional, default is no.<br>
  * -t   timeout after which server is treated as unavailable, optional, default is 5s.<br>
  *
- * example usage:<br>
+ * Example usage:<br>
  * ./radio-proxy -h waw02-03.ic.smcdn.pl -r /t050-1.mp3 -p 8000<br>
  *
  * In proxy mode, downloaded audio and metadata are redirected to connected receivers.
@@ -37,7 +37,7 @@
  * error which makes further work impossible. In case of failure associated
  * message is printed to stderr.
  *
- * Detailed communication protocol is available at todo.
+ * Detailed communication protocol is available at TODO.
  *
  * @author Piotr Jasinski <jasinskipiotr99@gmail.com>
  * @date 07.06.2020
@@ -304,7 +304,7 @@ static int parse_args(int argc, char *argv[]) {
     }
 
     // Checks if all proxy optional arguments appeared at most ones or didn't
-    // apear if proxy required args wasn't set.
+    // appear if proxy required args wasn't set.
     for (auto &proxy_opt_arg : proxy_opt_args) {
         if (proxy_opt_arg.second > 1 || proxy_opt_arg.second < 0)
             return -1;
@@ -863,7 +863,7 @@ static int receiving_response(int radio_server_sock, int radio_proxy_sock) {
 
 /** @brief Runs radio-proxy.
  * If any error occurred which makes further work impossible and program
- * didn't terminate before, returns 1. Detailed usage is described in todo.
+ * didn't terminate before, returns 1. Detailed usage is described in TODO.
  * Finishes work after SIGINT was received or error occurred.
  * @param argc [in]   - number of arguments,
  * @param argv [in]   - array of arguments.
