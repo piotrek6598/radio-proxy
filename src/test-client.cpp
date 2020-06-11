@@ -1,3 +1,7 @@
+// Simple client used to test radio-proxy. Works until SIGINT is received.
+// Prints audio to stdout and metadata to stderr, prints also some debug information to stderr,
+// sends keepalive every 10 received message(very ineffective)
+
 #include <iostream>
 #include <unordered_map>
 #include <cstring>
