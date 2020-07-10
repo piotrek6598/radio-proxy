@@ -406,14 +406,14 @@ static int create_proxy_socket() {
 static string create_radio_request() {
     string request = "GET ";
     request.append(resource_name);
-    request.append(" HTTP/1.0 \r\n");
+    request.append(" HTTP/1.0\r\n");
 
     request.append("Host: ");
     request.append(host_name);
     request.append("\r\n");
 
     if (metadata_request)
-        request.append("Icy-MetaData: 1 \r\n");
+        request.append("Icy-MetaData: 1\r\n");
 
     request.append("\r\n");
     return request;
