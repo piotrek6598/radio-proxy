@@ -18,7 +18,7 @@
  * error which makes further work impossible. In case of failure associated
  * message is printed to stderr.
  *
- * Detailed communication protocol is available at TODO.
+ * Detailed communication protocol is available in file 'Communication-protocol'.
  *
  * @author Piotr Jasinski <jasinskipiotr99@gmail.com>
  * @date 11.06.2020
@@ -860,7 +860,7 @@ static int handle_telnet_session() {
 
 /** @brief Runs radio-client.
  * If any error occurred which makes further work impossible and program
- * didn't terminate before, returns 1. Detailed usage is described in TODO.
+ * didn't terminate before, returns 1.
  * Finishes work after SIGINT or telnet request was received or error occurred.
  * @param argc [in]   - number of arguments,
  * @param argv [in]   - array of arguments.

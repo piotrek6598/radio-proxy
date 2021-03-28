@@ -29,4 +29,4 @@ Received audio is written to stdout, metadata are sent to telnet and presented i
 Usage is: <br><b>
 ./radio-client -H proxy/multicast/broadcast-address -P proxy-port -p telnet-port [-T proxy-timeout] <br><br></b>
 
-Detailed usage and communication protoc is available in todo.
+Detailed usage with examples is at the top of source files, communication protocol is available in file 'Communication-protocol.pdf'
